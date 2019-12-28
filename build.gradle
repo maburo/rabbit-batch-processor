@@ -16,6 +16,7 @@ configurations {
 
 repositories {
 	mavenLocal()
+	jcenter()
 	mavenCentral()
 }
 
@@ -23,6 +24,7 @@ dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-amqp'
 	implementation 'org.springframework.boot:spring-boot-starter-web'
 	implementation 'io.projectreactor:reactor-core:3.3.1.RELEASE'
+	implementation "io.projectreactor.rabbitmq:reactor-rabbitmq:1.4.1.RELEASE"
 
 	compileOnly 'org.projectlombok:lombok'
 	annotationProcessor 'org.projectlombok:lombok'

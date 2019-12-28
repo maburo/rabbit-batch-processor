@@ -1,102 +1,80 @@
 package com.example.rabbitbatchconsumer;
 
-import com.rabbitmq.client.Channel;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import com.rabbitmq.client.Connection;
+import com.rabbitmq.client.ConnectionFactory;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.core.Queue;
-import org.springframework.amqp.rabbit.annotation.RabbitListener;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.amqp.support.AmqpHeaders;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.amqp.RabbitProperties;
 import org.springframework.context.annotation.Bean;
-import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.scheduling.annotation.EnableScheduling;
-import org.springframework.scheduling.annotation.Scheduled;
 import reactor.core.Disposable;
-import reactor.core.publisher.FluxSink;
-import reactor.core.publisher.UnicastProcessor;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.rabbitmq.*;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.time.Duration;
-import java.time.temporal.ChronoUnit;
 
 @Slf4j
 @EnableScheduling
 @SpringBootApplication
 public class RabbitBatchConsumerApplication {
 
-	@Data
-	@NoArgsConstructor
-	@AllArgsConstructor
-	public static class Message {
-		private long deliveryTag;
-		private Channel channel;
-		private String payload;
-	}
-
 	public static void main(String[] args) {
 		SpringApplication.run(RabbitBatchConsumerApplication.class, args);
 	}
 
-	private static final String QUEUE_NAME = "batch_queue";
-
-	@Autowired
-	private FluxSink<Message> sink;
-
-	@Autowired
-	private UnicastProcessor<Message> processor;
-
-	@Autowired
-	private RabbitTemplate rabbitTemplate;
+	public static final String QUEUE_NAME = "batch_queue";
 
 	@Bean
-	public UnicastProcessor<Message> publisher() {
-		return UnicastProcessor.create();
+	Mono<Connection> connectionMono(RabbitProperties rabbitProperties) {
+		ConnectionFactory connectionFactory = new ConnectionFactory();
+		connectionFactory.setHost(rabbitProperties.getHost());
+		connectionFactory.setPort(rabbitProperties.getPort());
+//		connectionFactory.setVirtualHost(rabbitProperties.getVirtualHost());
+		connectionFactory.setUsername(rabbitProperties.getUsername());
+		connectionFactory.setPassword(rabbitProperties.getPassword());
+		return Mono.fromCallable(() -> connectionFactory.newConnection("reactor-rabbit")).cache();
 	}
 
 	@Bean
-	public FluxSink<Message> sink(UnicastProcessor<Message> processor) {
-		return processor.sink();
+	public Sender sender(Mono<Connection> connectionMono) {
+		return RabbitFlux.createSender(new SenderOptions().connectionMono(connectionMono));
 	}
 
 	@Bean
-	public Queue batchQueue() {
-		return new Queue(QUEUE_NAME, true);
-	}
-
-	@Scheduled(fixedDelay = 1000)
-	public void sendMessage() {
-		System.out.println("send...");
-		rabbitTemplate.convertAndSend("batch_queue", System.currentTimeMillis());
-	}
-
-	@RabbitListener(queues = "batch_queue", ackMode = "MANUAL")
-	public void onMessage(String message, Channel channel, @Header(AmqpHeaders.DELIVERY_TAG) long tag) {
-		System.out.println("onMessage...");
-		sink.next(new Message(tag, channel, message));
+	public Receiver receiver(Mono<Connection> connectionMono) {
+		return RabbitFlux.createReceiver(new ReceiverOptions().connectionMono(connectionMono));
 	}
 
 	@Bean
-	public Disposable subscriber() {
-		return processor.bufferTimeout(10, Duration.of(5, ChronoUnit.SECONDS))
+	public Disposable source(Sender sender) {
+		Flux<OutboundMessage> source = Flux.interval(Duration.ofSeconds(1))
+				.map(num -> Long.toString(num))
+				.map(str -> new OutboundMessage("", QUEUE_NAME, str.getBytes()));
+
+		return sender.declareQueue(QueueSpecification.queue(QUEUE_NAME))
+				.thenMany(sender.sendWithPublishConfirms(source))
+				.doOnEach(msg -> System.out.println("Sending..."))
+				.subscribe();
+	}
+
+	@Bean
+	public Disposable sink(Sender sender, Receiver receiver) {
+		return receiver.consumeManualAck(QUEUE_NAME)
+				.delaySubscription(sender.declareQueue(QueueSpecification.queue(QUEUE_NAME)))
+				.bufferTimeout(10, Duration.ofSeconds(5))
 				.subscribe(list -> {
-					System.out.println("Batch processing...");
-					list.forEach(this::acknowledge);
-					System.out.println("Batch complete");
-				}, t -> log.error("Error", t));
-	}
-
-	private void acknowledge(Message message) {
-		try {
-			System.out.println(message.getPayload());
-			message.channel.basicAck(message.getDeliveryTag(), false);
-		} catch (IOException e) {
-			throw new UncheckedIOException(e);
-		}
+					log.info("Batch START");
+					list.forEach(delivery -> {
+						try {
+							log.info("Message: {}", new String(delivery.getBody()));
+							delivery.ack();
+						} catch (Exception ex) {
+							delivery.nack(false);
+						}
+					});
+					log.info("Batch END");
+				}, t -> log.error("Err", t));
 	}
 }
